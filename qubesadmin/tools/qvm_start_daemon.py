@@ -322,7 +322,7 @@ def get_monitor_layout():
 class DAEMONLauncher:
     """Launch GUI/AUDIO daemon for VMs"""
 
-    def __init__(self, app: qubesadmin.app.QubesBase, vm_names=None, kde=False):
+    def __init__(self, app: qubesadmin.app.QubesBase, services, vm_names=None, kde=False):
         """ Initialize DAEMONLauncher.
 
         :param app: :py:class:`qubesadmin.Qubes` instance
@@ -333,6 +333,7 @@ class DAEMONLauncher:
         self.started_processes = {}
         self.vm_names = vm_names
         self.kde = kde
+        self.services = services
 
         # cache XID values when the VM was still running -
         # for cleanup purpose
@@ -491,6 +492,9 @@ class DAEMONLauncher:
         :param monitor_layout: monitor layout to send; if None, fetch it from
             local X server.
         """
+        if not "guivm" in self.services:
+            return
+
         guid_cmd = self.common_guid_args(vm)
         if self.kde:
             guid_cmd.extend(self.kde_guid_args(vm))
@@ -519,6 +523,9 @@ class DAEMONLauncher:
 
         This function is a coroutine.
         """
+        if not "guivm" in self.services:
+            return
+
         want_stubdom = force
         if not want_stubdom and \
                 vm.features.check_with_template('gui-emulated', False):
@@ -547,6 +554,10 @@ class DAEMONLauncher:
 
         :param vm: VM for which start AUDIO daemon
         """
+
+        if not "audiovm" in self.services:
+            return
+
         # pipewire with low latency causes a lot of underruns on some systems
         low_latency = not vm.features.check_with_template(
             'supported-service.pipewire', False)
@@ -569,6 +580,9 @@ class DAEMONLauncher:
             one for target AppVM is running.
         :param monitor_layout: monitor layout configuration
         """
+        if not "guivm" in self.services:
+            return
+
         guivm = getattr(vm, 'guivm', None)
         if guivm != vm.app.local_name:
             vm.log.info('GUI connected to {}. Skipping.'.format(guivm))
@@ -590,6 +604,9 @@ class DAEMONLauncher:
 
         :param vm: VM for which AUDIO daemon should be started
         """
+        if not "audiovm" in self.services:
+            return
+
         audiovm = getattr(vm, 'audiovm', None)
         if audiovm != vm.app.local_name:
             vm.log.info('AUDIO connected to {}. Skipping.'.format(audiovm))
@@ -606,6 +623,9 @@ class DAEMONLauncher:
         """Handler of 'domain-spawn' event, starts GUI daemon for stubdomain"""
 
         if not self.is_watched(vm):
+            return
+
+        if not "guivm" in self.services:
             return
 
         try:
@@ -629,30 +649,34 @@ class DAEMONLauncher:
 
         self.xid_cache[vm.name] = vm.xid, vm.stubdom_xid
 
-        try:
-            if getattr(vm, 'guivm', None) == vm.app.local_name and \
-                    vm.features.check_with_template('gui', True) and \
-                    kwargs.get('start_guid', 'True') == 'True':
-                asyncio.ensure_future(self.start_gui_for_vm(vm))
-        except qubesadmin.exc.QubesException as e:
-            vm.log.warning('Failed to start GUI for %s: %s', vm.name, str(e))
+        if "guivm" in self.services:
+            try:
+                if getattr(vm, 'guivm', None) == vm.app.local_name and \
+                        vm.features.check_with_template('gui', True) and \
+                        kwargs.get('start_guid', 'True') == 'True':
+                    asyncio.ensure_future(self.start_gui_for_vm(vm))
+            except qubesadmin.exc.QubesException as e:
+                vm.log.warning('Failed to start GUI for %s: %s', vm.name, str(e))
 
-        try:
-            if getattr(vm, 'audiovm', None) == vm.app.local_name and \
-                    vm.features.check_with_template('audio', True) and \
-                    kwargs.get('start_audio', 'True') == 'True':
-                asyncio.ensure_future(self.start_audio_for_vm(vm))
-        except qubesadmin.exc.QubesException as e:
-            vm.log.warning('Failed to start AUDIO for %s: %s', vm.name, str(e))
+        if "audiovm" in self.services:
+            try:
+                if getattr(vm, 'audiovm', None) == vm.app.local_name and \
+                        vm.features.check_with_template('audio', True) and \
+                        kwargs.get('start_audio', 'True') == 'True':
+                    asyncio.ensure_future(self.start_audio_for_vm(vm))
+            except qubesadmin.exc.QubesException as e:
+                vm.log.warning('Failed to start AUDIO for %s: %s', vm.name, str(e))
 
     def on_connection_established(self, _subject, _event, **_kwargs):
         """Handler of 'connection-established' event, used to launch GUI/AUDIO
         daemon for domains started before this tool. """
 
-        monitor_layout = get_monitor_layout()
-        self.app.domains.clear_cache()
+        if "guivm" in self.services:
+            monitor_layout = get_monitor_layout()
+            self.app.domains.clear_cache()
+
         for vm in self.app.domains:
-            if vm.klass == 'AdminVM':
+            if "guivm" in self.services and vm.klass == 'AdminVM':
                 continue
 
             if not self.is_watched(vm):
@@ -748,8 +772,9 @@ def main(args=None):
     only_if_service_enabled = ['guivm', 'audiovm']
     enabled_services = [service for service in only_if_service_enabled if
                         os.path.exists('/var/run/qubes-service/%s' % service)]
-    if not enabled_services and '--force' not in sys.argv and \
-            not os.path.exists('/etc/qubes-release'):
+    if os.path.exists('/etc/qubes-release'):
+        enabled_services = only_if_service_enabled
+    if not enabled_services and '--force' not in sys.argv:
         print(parser.format_help())
         return
     args = parser.parse_args(args)
@@ -763,7 +788,8 @@ def main(args=None):
     launcher = DAEMONLauncher(
         args.app,
         vm_names=vm_names,
-        kde=args.kde)
+        kde=args.kde,
+        services=enabled_services)
 
     if args.watch:
         fd = os.open(args.pidfile,
@@ -785,8 +811,14 @@ def main(args=None):
             lock_f.flush()
             lock_f.truncate()
             loop = asyncio.get_event_loop()
-            # pylint: disable=no-member
-            events = qubesadmin.events.EventsDispatcher(args.app)
+
+            if "guivm" in enabled_services:
+                # pylint: disable=no-member
+                events = qubesadmin.events.EventsDispatcher(args.app)
+            else:
+                # pylint: disable=no-member
+                events = qubesadmin.events.EventsDispatcher(args.app,enable_cache=False)
+                
             # pylint: enable=no-member
             launcher.register_events(events)
 
@@ -799,12 +831,13 @@ def main(args=None):
             loop.add_signal_handler(signal.SIGHUP,
                                     launcher.send_monitor_layout_all)
 
-            conn = xcffib.connect()
-            x_watcher = XWatcher(conn, args.app)
-            x_fd = conn.get_file_descriptor()
-            loop.add_reader(x_fd, x_watcher.event_reader,
-                            events_listener.cancel)
-            x_watcher.update_keyboard_layout()
+            if "guivm" in enabled_services:
+                conn = xcffib.connect()
+                x_watcher = XWatcher(conn, args.app)
+                x_fd = conn.get_file_descriptor()
+                loop.add_reader(x_fd, x_watcher.event_reader,
+                                events_listener.cancel)
+                x_watcher.update_keyboard_layout()
 
             try:
                 loop.run_until_complete(events_listener)
